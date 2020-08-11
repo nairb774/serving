@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sync"
 
 	"go.uber.org/atomic"
 )
@@ -169,7 +168,7 @@ func (b *Breaker) InFlight() int {
 
 // UpdateConcurrency updates the maximum number of in-flight requests.
 func (b *Breaker) UpdateConcurrency(size int) error {
-	return b.sem.updateCapacity(size)
+	return b.sem.updateCapacity(size, nil)
 }
 
 // Capacity returns the number of allowed in-flight requests on this breaker.
@@ -185,7 +184,7 @@ func newSemaphore(maxCapacity, initialCapacity int) *semaphore {
 	queue := make(chan struct{}, maxCapacity)
 	sem := &semaphore{queue: queue}
 	if initialCapacity > 0 {
-		sem.updateCapacity(initialCapacity)
+		sem.updateCapacity(initialCapacity, nil)
 	}
 	return sem
 }
@@ -196,9 +195,7 @@ func newSemaphore(maxCapacity, initialCapacity int) *semaphore {
 // `capacity` defines the current number of tokens in the rotation.
 type semaphore struct {
 	queue    chan struct{}
-	reducers int
-	capacity int
-	mux      sync.RWMutex
+	capacity atomic.Int32
 }
 
 // tryAcquire receives the token from the semaphore if there's one
@@ -226,15 +223,6 @@ func (s *semaphore) acquire(ctx context.Context) error {
 // If the semaphore capacity was reduced in between and is not yet reflected,
 // we remove the tokens from the rotation instead of returning them back.
 func (s *semaphore) release() error {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if s.reducers > 0 {
-		s.capacity--
-		s.reducers--
-		return nil
-	}
-
 	// We want to make sure releasing a token is always non-blocking.
 	select {
 	case s.queue <- struct{}{}:
@@ -247,61 +235,43 @@ func (s *semaphore) release() error {
 
 // updateCapacity updates the capacity of the semaphore to the desired
 // size.
-func (s *semaphore) updateCapacity(size int) error {
+func (s *semaphore) updateCapacity(size int, abort <-chan struct{}) error {
 	if size < 0 || size > cap(s.queue) {
 		return ErrUpdateCapacity
 	}
+	size32 := int32(size)
 
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if s.effectiveCapacity() == size {
+	lastSize := s.capacity.Swap(size32)
+	if lastSize == size32 {
 		return nil
 	}
 
-	// Add capacity until we reach size, potentially consuming
-	// outstanding reducers first.
-	for s.effectiveCapacity() < size {
-		if s.reducers > 0 {
-			s.reducers--
-		} else {
-			select {
-			case s.queue <- struct{}{}:
-				s.capacity++
-			default:
-				// This indicates that we're operating close to
-				// MaxCapacity and returned more tokens than we
-				// acquired.
-				return ErrUpdateCapacity
-			}
-		}
+	var dec, inc chan struct{}
+	if lastSize < size32 {
+		inc = s.queue
+	} else {
+		dec = s.queue
 	}
 
-	// Reduce capacity until we reach size, potentially adding
-	// new reducers if the queue channel is empty because of
-	// requests in-flight.
-	for s.effectiveCapacity() > size {
+	for lastSize != size32 {
 		select {
-		case <-s.queue:
-			s.capacity--
-		default:
-			s.reducers++
+		case inc <- struct{}{}:
+			lastSize++
+
+		case <-dec:
+			lastSize--
+
+		case <-abort:
+			s.capacity.Add(lastSize - size32)
+			return ErrUpdateCapacity
+
 		}
 	}
 
 	return nil
 }
 
-// effectiveCapacity is the capacity with reducers taken into account.
-// `mux` must be held to call it.
-func (s *semaphore) effectiveCapacity() int {
-	return s.capacity - s.reducers
-}
-
 // Capacity is the effective capacity after taking reducers into account.
 func (s *semaphore) Capacity() int {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-
-	return s.effectiveCapacity()
+	return int(s.capacity.Load())
 }
